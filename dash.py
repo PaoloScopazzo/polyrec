@@ -28,6 +28,14 @@ from zoneinfo import ZoneInfo
 import requests
 import websocket
 
+# Force UTF-8 on stdout/stderr so box-drawing chars in render_loop don't
+# blow up under Windows cp1252 / cp850 default code pages.
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except (AttributeError, ValueError):
+    pass
+
 # ---- Chainlink (CL) ----
 CL_URL = "wss://ws-live-data.polymarket.com"
 CL_SYMBOL = "btc/usd"
@@ -90,6 +98,7 @@ lock_cl = threading.Lock()
 lock_bn = threading.Lock()
 lock_pm = threading.Lock()
 stop_event = threading.Event()
+_app_started_at = time.monotonic()
 
 # Global websocket references for cleanup
 ws_binance = None
@@ -109,6 +118,7 @@ class DataLogger:
         self.current_slug = None
         self.csv_writer = None
         self.csv_file = None
+        self.rows_written = 0
         self.fieldnames = self._build_fieldnames()
         
         # Start background writer thread
@@ -308,6 +318,7 @@ class DataLogger:
                 if self.csv_writer:
                     self.csv_writer.writerow(row)
                     self.csv_file.flush()  # Flush immediately to not lose data
+                    self.rows_written += 1
                 
             except Exception as e:
                 print(f"\n[LOGGER] Error writing: {e}")
@@ -808,19 +819,23 @@ def chainlink_worker():
 
 _cl_first_logged = False
 _cl_first_price_logged = False
+_cl_update_count = 0
 
 
 def _apply_cl_price(price: float, ts_s: float, *, log_snapshot: bool = True) -> None:
     """Update shared Chainlink state with a single price tick. ts_s is epoch seconds."""
-    global _cl_first_price_logged
+    global _cl_first_price_logged, _cl_update_count
     with lock_cl:
         state_cl.price = price
         state_cl.ts = ts_s
         state_cl.price_history.append((ts_s, price))
         update_ptb(price, state_cl)
+    _cl_update_count += 1
     if not _cl_first_price_logged:
         _cl_first_price_logged = True
         print(f"\n[CL] INFO: first price received: {price} @ ts={ts_s:.3f}")
+    elif _cl_update_count % 50 == 0:
+        print(f"\n[CL] INFO: updates so far: {_cl_update_count}")
     if log_snapshot and logger:
         logger.log_snapshot('CL')
 
@@ -1020,13 +1035,20 @@ def polymarket_worker():
 def pm_on_message(message: str, tokens: dict):
     try:
         data = json.loads(message)
+    except Exception as exc:
+        print(f"\n[PM] WARN: non-JSON frame ({exc}): {str(message)[:80]}")
+        return
+    if not isinstance(data, dict):
+        print(f"\n[PM] WARN: skipped non-dict frame: <{type(data).__name__}, {str(message)[:80]}>")
+        return
+    try:
         if data.get("event_type") != "book":
             return
-        
+
         # Parse full orderbook
         bids_raw = data.get("bids", [])
         asks_raw = data.get("asks", [])
-        
+
         bids = parse_pm_orderbook(bids_raw)
         asks = parse_pm_orderbook(asks_raw)
         
@@ -1062,8 +1084,10 @@ def pm_on_message(message: str, tokens: dict):
         # Log snapshot
         if logger:
             logger.log_snapshot('PM')
+    except (AttributeError, TypeError) as exc:
+        print(f"\n[PM] WARN: skipped malformed frame ({type(exc).__name__}: {exc}): {str(message)[:80]}")
     except Exception as exc:
-        print(f"\n[PM] parse error: {exc}")
+        print(f"\n[PM] ERROR: parse error: {exc}")
 
 
 # ---- Render loop
@@ -1266,6 +1290,28 @@ def render_loop():
         time.sleep(0.5)
 
 
+def status_reporter():
+    """Every 5 minutes, emit a single STATUS line so the run can be sanity-checked
+    in long sessions without scrolling through render_loop output."""
+    while not stop_event.is_set():
+        if stop_event.wait(300):
+            return
+        uptime_s = int(time.monotonic() - _app_started_at)
+        h, rem = divmod(uptime_s, 3600)
+        m, s = divmod(rem, 60)
+        uptime = f"{h:02d}:{m:02d}:{s:02d}"
+        with lock_cl:
+            cl_p = state_cl.price
+        with lock_bn:
+            bn_p = state_bn.price
+        lag = (cl_p - bn_p) if (cl_p is not None and bn_p is not None) else None
+        csv_rows = logger.rows_written if logger else 0
+        print(
+            f"\n[STATUS] uptime={uptime} | cl_updates={_cl_update_count} | "
+            f"csv_rows={csv_rows} | binance_last={bn_p} | oracle_last={cl_p} | lag={lag}"
+        )
+
+
 def main():
     def handle_sigint(sig, frame):
         print("\nStopping...")
@@ -1299,6 +1345,7 @@ def main():
         threading.Thread(target=binance_worker, daemon=True),
         threading.Thread(target=polymarket_worker, daemon=True),
         threading.Thread(target=render_loop, daemon=True),
+        threading.Thread(target=status_reporter, daemon=True),
     ]
     for t in threads:
         t.start()

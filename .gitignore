@@ -21,6 +21,16 @@ secrets.json
 logs/
 *.log
 
+# Temporary probes / experiments — never commit
+*_probe.py
+ws_check.py
+
+# Historical analysis: ignore large datasets/artifacts, keep .py
+analysis/*.parquet
+analysis/*.json
+analysis/*.png
+analysis/*.csv
+
 # IDE / OS
 .vscode/
 .idea/
