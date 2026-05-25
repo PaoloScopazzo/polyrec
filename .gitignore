@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets — NEVER commit
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets.json
+
+# Logs / runtime artifacts
+logs/
+*.log
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
