@@ -13,8 +13,6 @@ Run:
 
 import csv
 import json
-import re
-import subprocess
 import signal
 import sys
 import threading
@@ -96,7 +94,7 @@ stop_event = threading.Event()
 # Global websocket references for cleanup
 ws_binance = None
 ws_polymarket = None
-cl_process = None
+ws_chainlink = None
 
 
 # ---- Data Logger
@@ -738,85 +736,149 @@ def calculate_eat_flow(depth_history: deque, seconds: float = 5.0) -> Optional[f
 # ---- Workers
 def chainlink_worker():
     """
-    Uses the existing Node script to mirror its output and parse the price line
-    `Price btc/usd: 89082 ...`.
+    Subscribes to Polymarket RTDS (channel `crypto_prices_chainlink`, symbol `btc/usd`)
+    and forwards every frame to cl_on_message. Reconnect with exponential backoff
+    (1, 2, 4, 8, 16, capped at 30s); backoff resets to 1s after a connection lasted
+    at least 60s.
     """
-    global cl_process
-    # Path to Chainlink feed script - adjust if needed
-    cmd = ["node", "./chainlink/btc-feed.js"]
+    global ws_chainlink
+    sub_msg = {
+        "action": "subscribe",
+        "subscriptions": [
+            {
+                "topic": "crypto_prices_chainlink",
+                "type": "update",
+                "filters": json.dumps({"symbol": CL_SYMBOL}),
+            }
+        ],
+    }
+    backoff = 1.0
+
     while not stop_event.is_set():
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            cl_process = proc
-            while not stop_event.is_set():
-                line = proc.stdout.readline()
-                if not line:
-                    if proc.poll() is not None:
-                        break
-                    time.sleep(0.1)
-                    continue
-                cl_on_message(line)
-            proc.terminate()
+        connected_at = {"ts": None}
+
+        def on_open(ws):
             try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        except Exception as exc:
-            print(f"\n[CL] exception: {exc}")
-        time.sleep(3)
-    if cl_process:
+                ws.send(json.dumps(sub_msg))
+                connected_at["ts"] = time.monotonic()
+                print(f"\n[CL] INFO: connected to {CL_URL}, subscribed crypto_prices_chainlink {CL_SYMBOL}")
+            except Exception as exc:
+                print(f"\n[CL] ERROR: subscribe send failed: {exc}")
+
+        def on_message(ws, message):
+            cl_on_message(message)
+
+        def on_error(ws, err):
+            print(f"\n[CL] ERROR: {err}")
+
+        def on_close(ws, code, reason):
+            print(f"\n[CL] WARN: connection closed (code={code}, reason={reason})")
+
+        ws = websocket.WebSocketApp(
+            CL_URL,
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+        )
+        ws_chainlink = ws
         try:
-            cl_process.terminate()
-            cl_process.wait(timeout=2)
-        except Exception:
-            cl_process.kill()
+            ws.run_forever(ping_interval=30, ping_timeout=10, skip_utf8_validation=True)
+        except Exception as exc:
+            print(f"\n[CL] ERROR: run_forever exception: {exc}")
+
+        if stop_event.is_set():
+            break
+
+        stable = (
+            connected_at["ts"] is not None
+            and (time.monotonic() - connected_at["ts"]) >= 60.0
+        )
+        if stable:
+            backoff = 1.0
+            print("\n[CL] INFO: previous connection was stable, resetting backoff")
+
+        sleep_for = backoff
+        print(f"\n[CL] WARN: reconnecting in {sleep_for:.0f}s")
+        stop_event.wait(sleep_for)
+
+        if not stable:
+            backoff = min(backoff * 2.0, 30.0)
 
 
 _cl_first_logged = False
+_cl_first_price_logged = False
 
 
-def cl_on_message(message: str):
+def _apply_cl_price(price: float, ts_s: float, *, log_snapshot: bool = True) -> None:
+    """Update shared Chainlink state with a single price tick. ts_s is epoch seconds."""
+    global _cl_first_price_logged
+    with lock_cl:
+        state_cl.price = price
+        state_cl.ts = ts_s
+        state_cl.price_history.append((ts_s, price))
+        update_ptb(price, state_cl)
+    if not _cl_first_price_logged:
+        _cl_first_price_logged = True
+        print(f"\n[CL] INFO: first price received: {price} @ ts={ts_s:.3f}")
+    if log_snapshot and logger:
+        logger.log_snapshot('CL')
+
+
+def cl_on_message(message):
     try:
         if isinstance(message, (bytes, bytearray)):
             message = message.decode(errors="ignore")
         message = message.strip()
         if not message:
             return
-        # Fast path: JSON message
         try:
             data = json.loads(message)
-        except Exception:
-            data = None
-
-        if data is None:
-            # Parse text output: "CL: 89082" or "Price btc/usd: 89082"
-            m = re.search(r"CL:\s*([0-9.]+)", message, re.IGNORECASE)
-            if not m:
-                m = re.search(r"Price\s+btc/usd:\s*([0-9.]+)", message, re.IGNORECASE)
-            if m:
-                price = float(m.group(1))
-                ts = now()
-                with lock_cl:
-                    state_cl.price = price
-                    state_cl.ts = ts
-                    state_cl.price_history.append((ts, price))
-                    update_ptb(price, state_cl)
-                
-                # Log snapshot
-                if logger:
-                    logger.log_snapshot('CL')
+        except Exception as exc:
+            print(f"\n[CL] WARN: non-JSON frame dropped ({exc}): {message[:200]}")
             return
 
-        channel = data.get("channel") or data.get("topic")
-        payload = data.get("payload") or data.get("data") or {}
-        symbol = (payload.get("symbol") or payload.get("pair") or payload.get("name") or "").lower()
-        is_cl_channel = channel in ("crypto_prices_chainlink", "crypto_prices")
-        if is_cl_channel:
+        topic = data.get("topic")
+        mtype = data.get("type")
+        payload = data.get("payload") or {}
+
+        # --- Primary route: live Chainlink update ---
+        if topic == "crypto_prices_chainlink" and mtype == "update":
+            price_val = payload.get("value")
+            ts_ms = payload.get("timestamp")
+            if price_val is None:
+                return
+            price = float(price_val)
+            ts_s = (float(ts_ms) / 1000.0) if ts_ms is not None else now()
+            _apply_cl_price(price, ts_s)
+            return
+
+        # --- Backfill route: initial snapshot delivered as crypto_prices/subscribe ---
+        if topic == "crypto_prices" and mtype == "subscribe":
+            series = payload.get("data") or []
+            count = 0
+            last_price = None
+            last_ts_s = None
+            for item in series:
+                v = item.get("value")
+                t = item.get("timestamp")
+                if v is None:
+                    continue
+                last_price = float(v)
+                last_ts_s = (float(t) / 1000.0) if t is not None else now()
+                with lock_cl:
+                    state_cl.price_history.append((last_ts_s, last_price))
+                count += 1
+            if last_price is not None:
+                # Treat the most recent backfill point as the current price too,
+                # so indicators have a valid `state_cl.price` from t0.
+                _apply_cl_price(last_price, last_ts_s, log_snapshot=False)
+            print(f"\n[CL] INFO: backfill received: {count} ticks (last={last_price})")
+            return
+
+        # --- Legacy fallback: old "channel" key (should never trigger now) ---
+        legacy_channel = data.get("channel")
+        if legacy_channel in ("crypto_prices_chainlink", "crypto_prices"):
             price_val = (
                 payload.get("value")
                 or payload.get("price")
@@ -824,27 +886,18 @@ def cl_on_message(message: str):
                 or payload.get("close")
                 or payload.get("mark")
             )
-            if price_val is None:
-                return
-            price = float(price_val)
-            ts = now()
-            with lock_cl:
-                state_cl.price = price
-                state_cl.ts = ts
-                state_cl.price_history.append((ts, price))
-                update_ptb(price, state_cl)
-            
-            # Log snapshot
-            if logger:
-                logger.log_snapshot('CL')
-        else:
-            # Log first unexpected message for debugging
-            global _cl_first_logged
-            if not _cl_first_logged:
-                _cl_first_logged = True
-                print(f"\n[CL] sample msg: {data}")
+            print(f"\n[CL] WARN: legacy 'channel' key matched ({legacy_channel}); update RTDS schema docs")
+            if price_val is not None:
+                _apply_cl_price(float(price_val), now())
+            return
+
+        # --- Unknown frame: log only the first one for diagnostics ---
+        global _cl_first_logged
+        if not _cl_first_logged:
+            _cl_first_logged = True
+            print(f"\n[CL] sample msg (unrouted): {data}")
     except Exception as exc:
-        print(f"\n[CL] parse error: {exc}")
+        print(f"\n[CL] ERROR: parse error: {exc}")
 
 
 def binance_worker():
@@ -1218,7 +1271,7 @@ def main():
         print("\nStopping...")
         stop_event.set()
         
-        # Close all websockets and subprocess
+        # Close all websockets
         if ws_binance:
             try:
                 ws_binance.close()
@@ -1229,9 +1282,9 @@ def main():
                 ws_polymarket.close()
             except Exception:
                 pass
-        if cl_process:
+        if ws_chainlink:
             try:
-                cl_process.terminate()
+                ws_chainlink.close()
             except Exception:
                 pass
 
